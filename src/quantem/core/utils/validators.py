@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, TypeAlias, Union, overload
+from typing import TYPE_CHECKING, Any, Optional, Union, overload
 from warnings import warn
 
 import numpy as np
@@ -18,7 +18,12 @@ else:
     if config.get("has_cupy"):
         import cupy as cp
 
-TensorLike: TypeAlias = ArrayLike | "torch.Tensor"
+if TYPE_CHECKING:
+    TensorLike = ArrayLike | torch.Tensor
+else:
+    # Runtime-safe alias for annotations; avoids evaluating a forward reference
+    # against typing.TypeAlias machinery during import.
+    TensorLike = ArrayLike
 
 
 # --- Dataset Validation Functions ---
