@@ -47,7 +47,7 @@ class Tomography(TomographyOpt, TomographyBase):
         dset: DatasetModelType,
         obj_model: ObjectINR | ObjectTensorDecomp,
         logger: LoggerTomography | None = None,
-        device: str = "cuda",
+        device: str | int | torch.device | None = None,
         verbose: int | bool = True,
         rng: np.random.Generator | int | None = None,
     ) -> Self:

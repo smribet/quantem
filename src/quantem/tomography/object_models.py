@@ -20,8 +20,11 @@ from quantem.tomography.dataset_models import TomographyINRPretrainDataset
 from quantem.tomography.tomography_context import ReconstructionContext
 
 
-def _tomography_autocast(device: torch.device | str, use_bfloat16: bool):
-    device = torch.device(device)
+def _tomography_autocast(device: torch.device | str | int, use_bfloat16: bool):
+    if isinstance(device, int):
+        device = torch.device(f"cuda:{device}" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
     enabled = bool(use_bfloat16 and device.type == "cuda" and torch.cuda.is_bf16_supported())
     return torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=enabled)
 
@@ -478,12 +481,16 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     def __init__(
         self,
         shape: tuple[int, int, int],
-        device: str = "cpu",
+        device: str | int | torch.device | None = None,
         rng: np.random.Generator | int | None = None,
         model: nn.Module | None = None,
         structural_model: Optional["ObjectINR | nn.Module"] = None,
         _token: object | None = None,
     ):
+        if device is None:
+            from quantem.core import config
+
+            device = config.get("device")
         super().__init__(
             shape=shape,
             device=device,
@@ -507,10 +514,14 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         cls,
         model: nn.Module,
         shape: tuple[int, int, int],
-        device: str = "cpu",
+        device: str | int | torch.device | None = None,
         rng: np.random.Generator | int | None = None,
         structural_model: Optional["ObjectINR | nn.Module"] = None,
     ):
+        if device is None:
+            from quantem.core import config
+
+            device = config.get("device")
         obj_model = cls(
             shape=shape,
             device=device,
@@ -520,7 +531,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         )
 
         obj_model.setup_distributed(device=device)
-        obj_model.to(device)
+        obj_model.to(obj_model.device)
         return obj_model
 
     def set_structural_model(
@@ -986,8 +997,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
             self._obj = pred_full.detach().cpu()
 
-    def to(self, device: str | torch.device):  # pyright: ignore[reportIncompatibleMethodOverride] -> better to do this device change
-        if isinstance(device, str):
+    def to(self, device: str | int | torch.device):  # pyright: ignore[reportIncompatibleMethodOverride] -> better to do this device change
+        if isinstance(device, int):
+            device = torch.device(f"cuda:{device}" if torch.cuda.is_available() else "cpu")
+        elif isinstance(device, str):
             device = torch.device(device)
         self._device = device
         if self.world_size == 1:

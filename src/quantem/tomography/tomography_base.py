@@ -29,7 +29,7 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         dset: DatasetModelType,
         obj_model: ObjectModelType,
         logger: LoggerTomography | None = None,
-        device: str = "cuda",
+        device: str | int | None = None,
         rng: np.random.Generator | int | None = None,
         verbose: int | bool = True,
         _token: object | None = None,
@@ -38,6 +38,10 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
             raise RuntimeError("Use .from_* to instantiate this class.")
 
         super().__init__()
+        if device is None:
+            from quantem.core import config
+
+            device = config.get("device")
         self.obj_model = obj_model
 
         self.dset = dset
@@ -58,7 +62,7 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
                 print("Setting up DDP for obj_model")
 
         self.dset = dset
-        self.dset.to(device)
+        self.dset.to(self.device)
 
     # --- Properties ---
     @property

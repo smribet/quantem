@@ -378,8 +378,10 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         return self._device
 
     @device.setter
-    def device(self, device: torch.device | str):
-        if isinstance(device, str):
+    def device(self, device: torch.device | str | int):
+        if isinstance(device, int):
+            device = torch.device(f"cuda:{device}" if torch.cuda.is_available() else "cpu")
+        elif isinstance(device, str):
             device = torch.device(device)
         self._device = device
 
@@ -561,7 +563,12 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         num_samples_per_ray: int,
         return_ray_dirs: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        with torch.autocast(device_type=self.device.type, enabled=False):
+        device_type = (
+            self.device.type
+            if isinstance(self.device, torch.device)
+            else torch.device(self.device).type
+        )
+        with torch.autocast(device_type=device_type, enabled=False):
             pixel_i = batch["pixel_i"].to(self.device, dtype=torch.float32, non_blocking=True)
             pixel_j = batch["pixel_j"].to(self.device, dtype=torch.float32, non_blocking=True)
             phis = batch["phi"].to(self.device, dtype=torch.float32, non_blocking=True)

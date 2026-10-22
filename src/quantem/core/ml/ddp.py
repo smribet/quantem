@@ -38,9 +38,21 @@ class DDPMixin:
             self.global_rank = 0
             self.local_rank = 0
 
-            if torch.cuda.is_available():
-                device = torch.device("cuda:0" if device is None else device)
-                torch.cuda.set_device(device.index)
+            if isinstance(device, int):
+                device = f"cuda:{device}" if torch.cuda.is_available() else "cpu"
+
+            if torch.cuda.is_available() and (device is None or str(device).startswith("cuda")):
+                device = torch.device(
+                    "cuda:0" if device is None or str(device) == "cuda" else device
+                )
+                if device.index is not None:
+                    torch.cuda.set_device(device.index)
+            elif (
+                device is not None
+                and str(device).startswith("mps")
+                and torch.backends.mps.is_available()
+            ):
+                device = torch.device("mps")
             else:
                 device = torch.device("cpu")
 
