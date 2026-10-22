@@ -706,8 +706,8 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         projection_idx = actual_idx // (self.tilt_stack.shape[1] * self.tilt_stack.shape[2])
         remaining = actual_idx % (self.tilt_stack.shape[1] * self.tilt_stack.shape[2])
 
-        pixel_i = remaining // self.tilt_stack.shape[1]
-        pixel_j = remaining % self.tilt_stack.shape[1]
+        pixel_i = remaining // self.tilt_stack.shape[2]
+        pixel_j = remaining % self.tilt_stack.shape[2]
 
         return {
             "projection_idx": torch.tensor(projection_idx),
@@ -723,8 +723,7 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         """
         Returns the number of pixels in the tilt stack.
         """
-        N = max(self.tilt_stack.shape)
-        return self.tilt_stack.shape[0] * N * N
+        return self.tilt_stack.shape[0] * self.tilt_stack.shape[1] * self.tilt_stack.shape[2]
 
     def to(self, device: torch.device | str):
         self._base_z1_angles = self._base_z1_angles.to(device)

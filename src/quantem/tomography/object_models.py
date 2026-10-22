@@ -682,7 +682,12 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         """
 
         if self.constraints.positivity:
-            pred = torch.clamp(pred, min=0.0, max=None)
+            pred_clamped = torch.clamp(pred, min=0.0, max=None)
+            if self.model.training:
+                # Straight-through leaky gradient prevents "dying ReLU" if all INR outputs fall below 0
+                pred = pred_clamped + 0.01 * (pred - pred.detach())
+            else:
+                pred = pred_clamped
         if self.constraints.shrinkage:
             pred = torch.max(pred - self.constraints.shrinkage, torch.zeros_like(pred))
 
@@ -1160,7 +1165,12 @@ class ObjectTensorDecomp(ObjectINR):
         """
 
         if self.constraints.positivity:
-            pred = torch.clamp(pred, min=0.0, max=None)
+            pred_clamped = torch.clamp(pred, min=0.0, max=None)
+            if self.model.training:
+                # Straight-through leaky gradient prevents "dying ReLU" if all INR outputs fall below 0
+                pred = pred_clamped + 0.01 * (pred - pred.detach())
+            else:
+                pred = pred_clamped
         if self.constraints.shrinkage:
             pred = torch.max(pred - self.constraints.shrinkage, torch.zeros_like(pred))
 
