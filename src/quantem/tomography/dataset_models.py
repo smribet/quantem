@@ -170,6 +170,8 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
         norm_quantile: bool = True,
+        z1_angles: NDArray | torch.Tensor | None = None,
+        normalize: bool = True,
         _token: object | None = None,
     ):
         AutoSerialize.__init__(self)
@@ -178,9 +180,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         if _token is not self._token:
             raise RuntimeError("Use TomographyPixDataset.from_* to instantiate this class.")
 
-        if not (
-            tilt_stack.shape[0] == tilt_angles.shape[0]
-        ):
+        if not (tilt_stack.shape[0] == tilt_angles.shape[0]):
             raise ValueError(
                 "The number of tilt projections should be in the first dimension of the dataset."
             )
@@ -189,18 +189,34 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
             tilt_stack = torch.from_numpy(tilt_stack)
         if type(tilt_angles) is not torch.Tensor:
             tilt_angles = torch.from_numpy(tilt_angles)
-        if norm_quantile:
-            max_val = torch.quantile(tilt_stack, 0.95)
-        else:
-            max_val = torch.max(tilt_stack)
+        tilt_stack = tilt_stack.float()
+        tilt_angles = tilt_angles.float()
 
-        # Tilt stack normalization
-        tilt_stack = tilt_stack / max_val
+        if normalize:
+            abs_stack = torch.abs(tilt_stack)
+            if norm_quantile:
+                max_val = torch.quantile(abs_stack, 0.95)
+            else:
+                max_val = torch.max(abs_stack)
+            max_val = torch.clamp(max_val, min=1e-8)
+            tilt_stack = tilt_stack / max_val
+            self.norm_factor = float(max_val.item())
+        else:
+            self.norm_factor = 1.0
 
         self.tilt_stack = tilt_stack
         self.tilt_angles = tilt_angles
         self.learn_shift = learn_shift
         self.learn_tilt_axis = learn_tilt_axis
+
+        if z1_angles is not None:
+            if not isinstance(z1_angles, torch.Tensor):
+                z1_angles = torch.from_numpy(z1_angles)
+            if z1_angles.shape[0] != tilt_angles.shape[0]:
+                raise ValueError("z1_angles must have the same length as tilt_angles.")
+            self._base_z1_angles = z1_angles.float()
+        else:
+            self._base_z1_angles = torch.zeros(tilt_angles.shape[0], dtype=torch.float32)
 
         # The reference tilt angle is the one with the smallest absolute tilt angle.
         # I.e, the pose will not be optimized for the reference tilt angle.
@@ -226,6 +242,8 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
         norm_quantile: bool = True,
+        z1_angles: NDArray | torch.Tensor | None = None,
+        normalize: bool = True,
     ):
         return cls(
             tilt_stack=tilt_stack,
@@ -233,8 +251,25 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
             learn_shift=learn_shift,
             learn_tilt_axis=learn_tilt_axis,
             norm_quantile=norm_quantile,
+            z1_angles=z1_angles,
+            normalize=normalize,
             _token=cls._token,
         )
+
+    def copy_pose_from(self, other: "TomographyDatasetBase", freeze: bool = True):
+        """
+        Copy learned pose parameters (shifts, z1, z3) and base z1 angles from another dataset
+        (e.g. transferring Phase 1 structural alignment to Phase 2 magnetic dataset).
+        """
+        self._base_z1_angles = other._base_z1_angles.detach().clone().to(self.device)
+        self._z1_params = nn.Parameter(other._z1_params.detach().clone().to(self.device))
+        self._z3_params = nn.Parameter(other._z3_params.detach().clone().to(self.device))
+        self._shifts_params = nn.Parameter(other._shifts_params.detach().clone().to(self.device))
+        if freeze:
+            self.learn_shift = False
+            self.learn_tilt_axis = False
+        if self.optimizer is not None:
+            self.reconnect_optimizer_to_parameters()
 
     # --- Optimization Parameters ---
 
@@ -404,6 +439,8 @@ class TomographyPixDataset(TomographyDatasetConstraints):
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
         norm_quantile: bool = True,
+        z1_angles: NDArray | torch.Tensor | None = None,
+        normalize: bool = True,
         _token: object | None = None,
     ):
         super().__init__(
@@ -412,6 +449,8 @@ class TomographyPixDataset(TomographyDatasetConstraints):
             learn_shift=learn_shift,
             learn_tilt_axis=learn_tilt_axis,
             norm_quantile=norm_quantile,
+            z1_angles=z1_angles,
+            normalize=normalize,
             _token=_token,
         )
 
@@ -436,10 +475,16 @@ class TomographyPixDataset(TomographyDatasetConstraints):
         """
         self.tilt_stack = self.tilt_stack.to(device)
         self.tilt_angles = self.tilt_angles.to(device)
+        self._base_z1_angles = self._base_z1_angles.to(device)
 
-        self._z1_params = nn.Parameter(self._z1_angles.to(device))
-        self._z3_params = nn.Parameter(self._z3_angles.to(device))
-        self._shifts_params = nn.Parameter(self._shifts.to(device))
+        if hasattr(self, "_z1_params"):
+            self._z1_params = nn.Parameter(self._z1_params.detach().to(device))
+            self._z3_params = nn.Parameter(self._z3_params.detach().to(device))
+            self._shifts_params = nn.Parameter(self._shifts_params.detach().to(device))
+        else:
+            self._z1_params = nn.Parameter(self._z1_angles.to(device))
+            self._z3_params = nn.Parameter(self._z3_angles.to(device))
+            self._shifts_params = nn.Parameter(self._shifts.to(device))
 
         self._z1_ref = self._z1_ref.to(device)
         self._z3_ref = self._z3_ref.to(device)
@@ -465,6 +510,8 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
         norm_quantile: bool = True,
+        z1_angles: NDArray | torch.Tensor | None = None,
+        normalize: bool = True,
         seed: int = 42,
         _token: object | None = None,
     ):
@@ -474,6 +521,8 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
             learn_shift,
             learn_tilt_axis,
             norm_quantile,
+            z1_angles=z1_angles,
+            normalize=normalize,
             _token=_token,
         )
 
@@ -490,37 +539,35 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
 
         first_half_z1 = self.z1_params[: self.reference_tilt_idx]
         second_half_z1 = self.z1_params[self.reference_tilt_idx :]
-        z1 = torch.cat([first_half_z1, self._z1_ref, second_half_z1], dim=0)
+        z1_offset = torch.cat([first_half_z1, self._z1_ref, second_half_z1], dim=0)
 
         first_half_z3 = self.z3_params[: self.reference_tilt_idx]
         second_half_z3 = self.z3_params[self.reference_tilt_idx :]
         z3 = torch.cat([first_half_z3, self._z3_ref, second_half_z3], dim=0)
 
-        if self.learn_shift and self.learn_tilt_axis:
-            return shifts, z1, z3
-        elif self.learn_shift:
-            return shifts, torch.zeros_like(z1), torch.zeros_like(z3)
-        elif self.learn_tilt_axis:
-            return torch.zeros_like(shifts), z1, z3
-        else:
-            return torch.zeros_like(shifts), torch.zeros_like(z1), torch.zeros_like(z3)
+        if not self.learn_shift:
+            shifts = shifts.detach()
+        if not self.learn_tilt_axis:
+            z1_offset = z1_offset.detach()
+            z3 = z3.detach()
+
+        z1 = self._base_z1_angles + z1_offset
+        return shifts, z1, z3
 
     def get_coords(
-        self, batch: dict[str, torch.Tensor], N: int, num_samples_per_ray: int
-    ) -> torch.Tensor:
+        self,
+        batch: dict[str, torch.Tensor],
+        N: int,
+        num_samples_per_ray: int,
+        return_ray_dirs: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         with torch.autocast(device_type=self.device.type, enabled=False):
-            pixel_i = batch["pixel_i"].to(
-                self.device, dtype=torch.float32, non_blocking=True
-            )
-            pixel_j = batch["pixel_j"].to(
-                self.device, dtype=torch.float32, non_blocking=True
-            )
+            pixel_i = batch["pixel_i"].to(self.device, dtype=torch.float32, non_blocking=True)
+            pixel_j = batch["pixel_j"].to(self.device, dtype=torch.float32, non_blocking=True)
             phis = batch["phi"].to(self.device, dtype=torch.float32, non_blocking=True)
             projection_indices = batch["projection_idx"].to(self.device, non_blocking=True)
             with torch.no_grad():
-                batch_ray_coords = self.create_batch_rays(
-                    pixel_i, pixel_j, N, num_samples_per_ray
-                )
+                batch_ray_coords = self.create_batch_rays(pixel_i, pixel_j, N, num_samples_per_ray)
 
             shifts, z1_params, z3_params = self.forward(None)
             batch_shifts = torch.index_select(shifts.float(), 0, projection_indices)
@@ -536,7 +583,12 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
                 N=N,
                 sampling_rate=1.0,
             )
-            return transformed_rays.reshape(-1, 3)
+            coords = transformed_rays.reshape(-1, 3)
+            if return_ray_dirs:
+                ray_vec = transformed_rays[:, -1, :] - transformed_rays[:, 0, :]
+                ray_dirs = ray_vec / (torch.linalg.norm(ray_vec, dim=-1, keepdim=True) + 1e-8)
+                return coords, ray_dirs
+            return coords
 
     @staticmethod
     def create_batch_rays(
@@ -610,12 +662,23 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
 
     @staticmethod
     def integrate_rays(
-        rays: torch.Tensor, num_samples_per_ray: int, target_values_len: int
+        rays: torch.Tensor,
+        num_samples_per_ray: int,
+        target_values_len: int,
+        ray_dirs: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        ray_densities = rays.view(
-            target_values_len,
-            num_samples_per_ray,
-        )
+        if rays.dim() == 2 and rays.shape[-1] == 3:
+            if ray_dirs is None:
+                raise ValueError(
+                    "ray_dirs must be provided to integrate_rays when integrating a 3D vector field."
+                )
+            ray_vectors = rays.view(target_values_len, num_samples_per_ray, 3)
+            ray_densities = (ray_vectors * ray_dirs.unsqueeze(1)).sum(dim=-1)
+        else:
+            ray_densities = rays.view(
+                target_values_len,
+                num_samples_per_ray,
+            )
         step_size = 2.0 / (num_samples_per_ray - 1)
 
         predicted_values = ray_densities.sum(dim=1) * step_size
@@ -657,9 +720,15 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         return self.tilt_stack.shape[0] * N * N
 
     def to(self, device: torch.device | str):
-        self._z1_params = nn.Parameter(self._z1_angles.to(device))
-        self._z3_params = nn.Parameter(self._z3_angles.to(device))
-        self._shifts_params = nn.Parameter(self._shifts.to(device))
+        self._base_z1_angles = self._base_z1_angles.to(device)
+        if hasattr(self, "_z1_params"):
+            self._z1_params = nn.Parameter(self._z1_params.detach().to(device))
+            self._z3_params = nn.Parameter(self._z3_params.detach().to(device))
+            self._shifts_params = nn.Parameter(self._shifts_params.detach().to(device))
+        else:
+            self._z1_params = nn.Parameter(self._z1_angles.to(device))
+            self._z3_params = nn.Parameter(self._z3_angles.to(device))
+            self._shifts_params = nn.Parameter(self._shifts.to(device))
 
         self._z1_ref = self._z1_ref.to(device)
         self._z3_ref = self._z3_ref.to(device)

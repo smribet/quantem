@@ -22,9 +22,7 @@ from quantem.tomography.tomography_context import ReconstructionContext
 
 def _tomography_autocast(device: torch.device | str, use_bfloat16: bool):
     device = torch.device(device)
-    enabled = bool(
-        use_bfloat16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
-    )
+    enabled = bool(use_bfloat16 and device.type == "cuda" and torch.cuda.is_bf16_supported())
     return torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=enabled)
 
 
@@ -107,10 +105,19 @@ class ObjConstraintParams:
         shrinkage: float = 0.0
         tv_vol: float = 0.0
         sparsity: float = 0.0
+        structural_threshold: float = 0.1
+        structural_sharpness: float = 30.0
+        structural_mode: str = "soft_mask"
         _name: str = "obj_inr"
 
         soft_constraint_keys = ["tv_vol", "sparsity"]
-        hard_constraint_keys = ["positivity", "shrinkage"]
+        hard_constraint_keys = [
+            "positivity",
+            "shrinkage",
+            "structural_threshold",
+            "structural_sharpness",
+            "structural_mode",
+        ]
 
     @dataclass
     class ObjTensorDecompConstraints(Constraints):
@@ -474,6 +481,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
         model: nn.Module | None = None,
+        structural_model: Optional["ObjectINR | nn.Module"] = None,
         _token: object | None = None,
     ):
         super().__init__(
@@ -484,11 +492,15 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         )
         self._pretrain_losses = []
         self._pretrain_lrs = []
+        self._structural_model: Optional["ObjectINR | nn.Module"] = None
+        self._structural_scale: float | None = None
         self.constraints: ObjConstraintParams.ObjINRConstraints = self.DEFAULT_CONSTRAINTS.copy()
         # Register the network submodule (important: real nn.Module attribute)
         if model is not None:
             self.setup_distributed(device=device)
             self._model = self.distribute_model(model)
+        if structural_model is not None:
+            self.set_structural_model(structural_model)
 
     @classmethod
     def from_model(
@@ -497,17 +509,101 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         shape: tuple[int, int, int],
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
+        structural_model: Optional["ObjectINR | nn.Module"] = None,
     ):
         obj_model = cls(
             shape=shape,
             device=device,
             rng=rng,
             model=model,  # ✅ build/register in __init__
+            structural_model=structural_model,
         )
 
         obj_model.setup_distributed(device=device)
         obj_model.to(device)
         return obj_model
+
+    def set_structural_model(
+        self,
+        structural_model: Optional["ObjectINR | nn.Module"],
+        threshold: float | None = None,
+        sharpness: float | None = None,
+        mode: str | None = None,
+    ):
+        """
+        Attach a frozen Phase 1 structural INR model to constrain a Phase 2 (e.g. magnetic vector)
+        reconstruction so that reconstructed signals are confined to the 3D structural support.
+        """
+        self._structural_model = structural_model
+        self._structural_scale = None
+        if structural_model is not None:
+            structural_model.to(self._device)
+            for p in structural_model.parameters():
+                p.requires_grad_(False)
+            if isinstance(structural_model, ObjectINR):
+                structural_model.model.eval()
+            else:
+                structural_model.eval()
+        if threshold is not None:
+            self.constraints.structural_threshold = threshold
+        if sharpness is not None:
+            self.constraints.structural_sharpness = sharpness
+        if mode is not None:
+            self.constraints.structural_mode = mode
+
+    @property
+    def structural_model(self) -> Optional["ObjectINR | nn.Module"]:
+        return self._structural_model
+
+    def compute_structural_envelope(self, coords: torch.Tensor) -> torch.Tensor:
+        """
+        Evaluate the Phase 1 structural model at ``coords`` and return a spatial support
+        envelope in ``[0, 1]`` according to ``self.constraints.structural_mode``.
+        """
+        assert self._structural_model is not None
+        with torch.no_grad():
+            struct_val = self._structural_model(coords)
+            if isinstance(struct_val, tuple):
+                struct_val = struct_val[0]
+            if struct_val.dim() > 1:
+                struct_val = struct_val.squeeze(-1)
+            struct_val = torch.clamp(struct_val.float(), min=0.0)
+
+            if self._structural_scale is None:
+                if (
+                    isinstance(self._structural_model, ObjectINR)
+                    and hasattr(self._structural_model, "_obj")
+                    and self._structural_model._obj is not None
+                    and self._structural_model._obj.numel() > 1
+                ):
+                    scale = float(
+                        torch.quantile(self._structural_model._obj.float(), 0.995).item()
+                    )
+                else:
+                    scale = float(torch.quantile(struct_val, 0.995).item())
+                self._structural_scale = max(scale, 1e-6)
+
+            s = struct_val / self._structural_scale
+            threshold = float(getattr(self.constraints, "structural_threshold", 0.1))
+            sharpness = float(getattr(self.constraints, "structural_sharpness", 30.0))
+            mode = str(getattr(self.constraints, "structural_mode", "soft_mask"))
+
+            if mode == "hard_mask":
+                envelope = (s > threshold).to(coords.dtype)
+            elif mode == "density_weight":
+                envelope = torch.clamp(s, min=0.0, max=1.0).to(coords.dtype)
+            else:
+                # Smooth sigmoid support gate that is strictly 0 at s <= 0 and approaches 1 for s > threshold
+                sig = torch.sigmoid(sharpness * (s - threshold))
+                sig0 = (
+                    float(np.sigmoid(-sharpness * threshold))
+                    if hasattr(np, "sigmoid")
+                    else (1.0 / (1.0 + float(np.exp(min(sharpness * threshold, 80.0)))))
+                )
+                envelope = torch.clamp((sig - sig0) / max(1.0 - sig0, 1e-6), min=0.0, max=1.0).to(
+                    coords.dtype
+                )
+        return envelope
 
     # --- Properties ---
 
@@ -586,6 +682,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     def get_tv_loss(self, ctx: ReconstructionContext) -> torch.Tensor:
         """
         Compute the total variation loss for the INR model.
+        Supports both scalar (out_features=1) and vector (out_features=3) INR models.
         """
         assert ctx.coords is not None, "coords must be provided for INR object model"
         num_tv_samples = min(10_000, ctx.coords.shape[0])
@@ -600,16 +697,33 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         if tv_densities_recomputed.dim() == 1:
             tv_densities_recomputed = tv_densities_recomputed.unsqueeze(-1)
 
-        # Compute gradients for each channel
-        grad_outputs = torch.autograd.grad(
-            outputs=tv_densities_recomputed,
-            inputs=tv_coords,
-            grad_outputs=torch.ones_like(tv_densities_recomputed),
-            create_graph=True,
-        )[0]  # Shape: [num_samples, coord_dim]
+        if self._structural_model is not None:
+            envelope = self.compute_structural_envelope(tv_coords).unsqueeze(-1)
+            tv_densities_recomputed = tv_densities_recomputed * envelope
 
-        # Compute TV loss - gradient magnitude per sample
-        grad_norm = torch.norm(grad_outputs, dim=1)  # Shape: [num_samples]
+        num_channels = tv_densities_recomputed.shape[-1]
+        if num_channels == 1:
+            grad_outputs = torch.autograd.grad(
+                outputs=tv_densities_recomputed,
+                inputs=tv_coords,
+                grad_outputs=torch.ones_like(tv_densities_recomputed),
+                create_graph=True,
+            )[0]  # Shape: [num_samples, coord_dim]
+            grad_norm = torch.norm(grad_outputs, dim=1)
+        else:
+            grad_norm_sq = torch.zeros(tv_coords.shape[0], device=tv_coords.device)
+            for c in range(num_channels):
+                channel_out = tv_densities_recomputed[:, c : c + 1]
+                grad_c = torch.autograd.grad(
+                    outputs=channel_out,
+                    inputs=tv_coords,
+                    grad_outputs=torch.ones_like(channel_out),
+                    create_graph=True,
+                    retain_graph=True,
+                )[0]
+                grad_norm_sq = grad_norm_sq + (grad_c**2).sum(dim=1)
+            grad_norm = torch.sqrt(grad_norm_sq + 1e-8)
+
         return self.constraints.tv_vol * grad_norm.mean()
 
     # --- Optimization Parameters ---
@@ -666,8 +780,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         assert coords is not None, "ObjectINR.forward requires coords"
 
         all_densities = self.model(coords)
+        if isinstance(all_densities, tuple):
+            all_densities = all_densities[0]
 
-        if all_densities.dim() > 1:
+        if all_densities.dim() > 1 and all_densities.shape[-1] == 1:
             all_densities = all_densities.squeeze(-1)
         valid_mask = (
             (coords[:, 0] >= -1) & (coords[:, 0] <= 1) & (coords[:, 1] >= -1) & (coords[:, 1] <= 1)
@@ -677,6 +793,12 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             valid_mask = valid_mask.unsqueeze(-1)
         # Multi-dimensional mask
         all_densities = all_densities * valid_mask
+
+        if self._structural_model is not None:
+            envelope = self.compute_structural_envelope(coords)
+            if all_densities.dim() > 1:
+                envelope = envelope.unsqueeze(-1)
+            all_densities = all_densities * envelope
 
         all_densities = self.apply_hard_constraints(all_densities)
 
@@ -783,7 +905,6 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             coords_1d = torch.linspace(-1, 1, N)
             x, y, z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing="ij")
             inputs = torch.stack([x, y, z], dim=-1).reshape(-1, 3)
-            model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
             inference_batch_size = 5 * N * N
             total_samples = N**3
@@ -807,11 +928,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                     self.device, non_blocking=True
                 )
 
-                batch_outputs = model(batch_coords)  # (B, C) or (B,) etc.
-
-                if isinstance(batch_outputs, tuple):
-                    batch_outputs = batch_outputs[0]
-                batch_outputs = self.apply_hard_constraints(batch_outputs)
+                batch_outputs = self.forward(batch_coords)  # (B, C) or (B,)
 
                 # Ensure shape is (B, C)
                 if batch_outputs.dim() == 1:
@@ -820,7 +937,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                 outputs_list.append(batch_outputs.cpu())
 
             outputs = torch.cat(outputs_list, dim=0)  # (local_B, C)
-            C = outputs.shape[-1]  # e.g. 5
+            C = outputs.shape[-1]  # e.g. 1 or 3
 
             if self.world_size > 1:
                 # gather variable-sized first dimension (local_B) while keeping channels
@@ -854,9 +971,15 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                 for rank, size in enumerate(all_sizes):
                     trimmed_outputs.append(gathered_outputs[rank][: size.item(), :])
 
-                pred_full = torch.cat(trimmed_outputs, dim=0).reshape(C, N, N, N).float()
+                pred_full = (
+                    torch.cat(trimmed_outputs, dim=0)
+                    .reshape(N, N, N, C)
+                    .permute(3, 0, 1, 2)
+                    .contiguous()
+                    .float()
+                )
             else:
-                pred_full = outputs.reshape(C, N, N, N).float()
+                pred_full = outputs.reshape(N, N, N, C).permute(3, 0, 1, 2).contiguous().float()
 
             if return_vol:
                 return pred_full.detach().cpu()
@@ -871,6 +994,8 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             self._model = self._model.to(device)
         elif not isinstance(self._model, torch.nn.parallel.DistributedDataParallel):
             self.distribute_model(self._model)
+        if self._structural_model is not None:
+            self._structural_model.to(device)
         self.reconnect_optimizer_to_parameters()
 
 

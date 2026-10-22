@@ -84,6 +84,7 @@ class Tomography(TomographyOpt, TomographyBase):
         ] = "l2",
         loss_func_kwargs: dict = {},
         reset_dset: DatasetModelType | None = None,
+        structural_model: ObjectINR | None = None,
         show_metrics: bool = False,
         use_bfloat16: bool = True,
     ):
@@ -91,6 +92,9 @@ class Tomography(TomographyOpt, TomographyBase):
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
         I.e, auto-detection through the obj model type, while both share the same pose optimization.
         """
+
+        if structural_model is not None and isinstance(self.obj_model, ObjectINR):
+            self.obj_model.set_structural_model(structural_model)
 
         # Check device consistency
         self.obj_model.to(self.device)
@@ -206,7 +210,9 @@ class Tomography(TomographyOpt, TomographyBase):
             for batch_idx, batch in enumerate(self.dataloader):
                 self.zero_grad_all()
                 with _tomography_autocast(self.device, use_bfloat16):
-                    all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
+                    all_coords, ray_dirs = self.dset.get_coords(
+                        batch, N, curr_num_samples_per_ray, return_ray_dirs=True
+                    )
 
                     all_densities = self.obj_model.forward(all_coords)
 
@@ -214,6 +220,7 @@ class Tomography(TomographyOpt, TomographyBase):
                         all_densities,
                         curr_num_samples_per_ray,
                         len(batch["target_value"]),
+                        ray_dirs=ray_dirs,
                     )
 
                 pred = integrated_densities.float()
@@ -284,7 +291,9 @@ class Tomography(TomographyOpt, TomographyBase):
 
                     for batch in self.val_dataloader:
                         with _tomography_autocast(self.device, use_bfloat16):
-                            all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
+                            all_coords, ray_dirs = self.dset.get_coords(
+                                batch, N, curr_num_samples_per_ray, return_ray_dirs=True
+                            )
 
                             all_densities = self.obj_model.forward(all_coords)
 
@@ -292,6 +301,7 @@ class Tomography(TomographyOpt, TomographyBase):
                                 all_densities,
                                 curr_num_samples_per_ray,
                                 len(batch["target_value"]),
+                                ray_dirs=ray_dirs,
                             )
 
                             target = (
