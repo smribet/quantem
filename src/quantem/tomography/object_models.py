@@ -668,10 +668,14 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             isinstance(self.constraints, ObjConstraintParams.ObjINRConstraints)
             and self.constraints.sparsity > 0
         ):  # NOTE: For the linter, I must make this :)
-            assert ctx.pred is not None, (
-                "pred must be provided for INR object model to compute the sparsity loss"
+            densities = ctx.all_densities if ctx.all_densities is not None else ctx.pred
+            assert densities is not None, (
+                "all_densities or pred must be provided for INR object model to compute the sparsity loss"
             )
-            sparsity_loss = self.constraints.sparsity * torch.norm(ctx.pred, p=1)
+            tau = 0.05
+            sparsity_loss = (
+                self.constraints.sparsity * (tau * torch.log1p(densities.abs() / tau)).mean()
+            )
             soft_loss += sparsity_loss
 
         return soft_loss
@@ -680,16 +684,16 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         """
         Apply hard constraints to the predicted values of the INR model.
         """
-
+        raw_pred = pred
+        if self.constraints.shrinkage:
+            pred = torch.max(pred - self.constraints.shrinkage, torch.zeros_like(pred))
         if self.constraints.positivity:
             pred_clamped = torch.clamp(pred, min=0.0, max=None)
             if self.model.training:
                 # Straight-through leaky gradient prevents "dying ReLU" if all INR outputs fall below 0
-                pred = pred_clamped + 0.01 * (pred - pred.detach())
+                pred = pred_clamped + 0.01 * (raw_pred - raw_pred.detach())
             else:
                 pred = pred_clamped
-        if self.constraints.shrinkage:
-            pred = torch.max(pred - self.constraints.shrinkage, torch.zeros_like(pred))
 
         return pred
 
@@ -801,8 +805,15 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
         if all_densities.dim() > 1 and all_densities.shape[-1] == 1:
             all_densities = all_densities.squeeze(-1)
+        all_densities = self.apply_hard_constraints(all_densities)
+
         valid_mask = (
-            (coords[:, 0] >= -1) & (coords[:, 0] <= 1) & (coords[:, 1] >= -1) & (coords[:, 1] <= 1)
+            (coords[:, 0] >= -1)
+            & (coords[:, 0] <= 1)
+            & (coords[:, 1] >= -1)
+            & (coords[:, 1] <= 1)
+            & (coords[:, 2] >= -1)
+            & (coords[:, 2] <= 1)
         ).float()
 
         if all_densities.dim() > 1:
@@ -815,8 +826,6 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             if all_densities.dim() > 1:
                 envelope = envelope.unsqueeze(-1)
             all_densities = all_densities * envelope
-
-        all_densities = self.apply_hard_constraints(all_densities)
 
         return all_densities
 
@@ -1163,16 +1172,16 @@ class ObjectTensorDecomp(ObjectINR):
         """
         Apply hard constraints to the predicted values of the INR model.
         """
-
+        raw_pred = pred
+        if self.constraints.shrinkage:
+            pred = torch.max(pred - self.constraints.shrinkage, torch.zeros_like(pred))
         if self.constraints.positivity:
             pred_clamped = torch.clamp(pred, min=0.0, max=None)
             if self.model.training:
                 # Straight-through leaky gradient prevents "dying ReLU" if all INR outputs fall below 0
-                pred = pred_clamped + 0.01 * (pred - pred.detach())
+                pred = pred_clamped + 0.01 * (raw_pred - raw_pred.detach())
             else:
                 pred = pred_clamped
-        if self.constraints.shrinkage:
-            pred = torch.max(pred - self.constraints.shrinkage, torch.zeros_like(pred))
 
         return pred
 
