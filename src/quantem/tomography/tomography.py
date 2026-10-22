@@ -183,7 +183,7 @@ class Tomography(TomographyOpt, TomographyBase):
 
         loss_func = get_loss_module(name=loss_type, dtype=self.obj_model.dtype, **loss_func_kwargs)
 
-        pbar = tqdm(range(num_iter), disable=not self.verbose)
+        pbar = tqdm(range(num_iter), disable=not self.verbose, dynamic_ncols=True)
         for a0 in pbar:
             consistency_loss = torch.tensor(0.0, device=self.device)
             total_loss = torch.tensor(0.0, device=self.device)
@@ -325,8 +325,11 @@ class Tomography(TomographyOpt, TomographyBase):
 
             total_loss, consistency_loss, epoch_soft_constraint_loss = metrics.tolist()
 
-            pbar.set_description(
-                f"Reconstruction | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e}"
+            pbar.set_description("Recon")
+            pbar.set_postfix(
+                loss=f"{total_loss:.3e}",
+                cons=f"{consistency_loss:.3e}",
+                reg=f"{epoch_soft_constraint_loss:.3e}",
             )
 
             self._epoch_losses.append(total_loss)
@@ -349,8 +352,11 @@ class Tomography(TomographyOpt, TomographyBase):
                             dataset_model=self.dset,
                             iter=self.num_epochs,
                         )
-                    pbar.set_description(
-                        f"Reconstruction | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e} | Images Logged"
+                    pbar.set_description("Recon (logged)")
+                    pbar.set_postfix(
+                        loss=f"{total_loss:.3e}",
+                        cons=f"{consistency_loss:.3e}",
+                        reg=f"{epoch_soft_constraint_loss:.3e}",
                     )
 
                 if self.global_rank == 0:
