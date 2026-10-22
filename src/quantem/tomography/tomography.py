@@ -126,6 +126,11 @@ class Tomography(TomographyOpt, TomographyBase):
 
         if obj_constraints is not None:
             if isinstance(obj_constraints, dict):
+                if "name" not in obj_constraints and "type" not in obj_constraints:
+                    obj_constraints = {
+                        "name": self.obj_model.constraints._name,
+                        **obj_constraints,
+                    }
                 obj_constraints = ObjConstraintParams.parse_dict(obj_constraints)
 
             self.obj_model.constraints = obj_constraints
@@ -506,6 +511,11 @@ class TomographyConventional(TomographyBase):
     ):
         if obj_constraints is not None:
             if isinstance(obj_constraints, dict):
+                if "name" not in obj_constraints and "type" not in obj_constraints:
+                    obj_constraints = {
+                        "name": self.obj_model.constraints._name,
+                        **obj_constraints,
+                    }
                 obj_constraints = ObjConstraintParams.parse_dict(obj_constraints)
 
             self.obj_model.constraints = obj_constraints
