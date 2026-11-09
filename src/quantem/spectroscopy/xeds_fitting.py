@@ -770,6 +770,9 @@ def fit_spectrum_pytorch(
     pytorch_spectrum_images = self._build_pytorch_spectrum_images(
         abundance_maps=abundance_maps,
         element_names=list(global_fit["element_names"]),
+        line_labels=list(global_fit["line_labels"]),
+        line_weights=global_fit["line_weights"].detach().cpu().numpy(),
+        line_element_indices=global_fit["line_element_indices"].detach().cpu().numpy(),
     )
     self._spectrum_images_pytorch = {
         **getattr(self, "_spectrum_images_pytorch", {}),

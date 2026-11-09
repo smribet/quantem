@@ -588,25 +588,48 @@ class Dataset3dxeds(Dataset3dspectroscopy):
         )
 
     def _build_pytorch_spectrum_images(
-        self, abundance_maps: np.ndarray, element_names: list[str] | tuple[str, ...]
+        self,
+        abundance_maps: np.ndarray,
+        element_names: list[str] | tuple[str, ...],
+        line_labels: list[str] | tuple[str, ...] | None = None,
+        line_weights: np.ndarray | list[float] | None = None,
+        line_element_indices: np.ndarray | list[int] | None = None,
     ) -> dict[str, Dataset2d]:
-        """Convert per-element abundance maps into per-line spectrum images using weights."""
+        """Convert per-element abundance maps into per-line spectrum images using normalized shell weights."""
         maps = np.asarray(abundance_maps)
         if maps.ndim != 3:
             return {}
 
         line_maps = {}
+        if (
+            line_labels is not None
+            and line_weights is not None
+            and line_element_indices is not None
+        ):
+            weights_arr = np.asarray(line_weights, dtype=float).reshape(-1)
+            elem_idx_arr = np.asarray(line_element_indices, dtype=int).reshape(-1)
+            for label, weight, elem_idx in zip(line_labels, weights_arr, elem_idx_arr):
+                if 0 <= elem_idx < maps.shape[0]:
+                    element_map = np.asarray(maps[elem_idx], dtype=float)
+                    line_maps[str(label)] = self._map_to_dataset2d(
+                        element_map * float(weight),
+                        name=str(label),
+                    )
+            return line_maps
+
         for i, element_name in enumerate(element_names):
             if i >= maps.shape[0]:
                 break
             try:
-                _, line_weights, line_labels = self.x_ray_lookup(str(element_name))
+                _, raw_weights, lookup_labels = self.x_ray_lookup(str(element_name))
             except ValueError:
                 continue
+            w_sum = float(np.sum(raw_weights))
+            norm_weights = raw_weights / w_sum if w_sum > 0 else raw_weights
             element_map = np.asarray(maps[i], dtype=float)
-            for weight, label in zip(line_weights, line_labels):
+            for weight, label in zip(norm_weights, lookup_labels):
                 line_maps[str(label)] = self._map_to_dataset2d(
-                    element_map * weight,
+                    element_map * float(weight),
                     name=str(label),
                 )
         return line_maps
@@ -616,11 +639,17 @@ class Dataset3dxeds(Dataset3dspectroscopy):
     ):
         """Quantify elemental composition using the Cliff-Lorimer thin-film method.
 
+        Standard tabulated Cliff-Lorimer k-factors (e.g. Si-referenced k_{A,Si})
+        relate measured X-ray intensities to weight fractions:
+        ``C_A / C_B = (k_A / k_B) * (I_A / I_B)``. Weight percent is computed
+        from ``k_i * I_i`` and atomic percent is obtained by dividing each
+        element's mass-weighted intensity by its atomic weight ``A_i``.
+
         Parameters
         ----------
         k_factors : dict[str, float]
             Mapping of element/line selectors to their k-factors, e.g.
-            ``{'Fe K': 1.0, 'Cu K': 1.45}``.  At least two elements are
+            ``{'Ni K': 1.587, 'W L': 4.901}``.  At least two elements are
             required.
         method : {"integration", "fit"}, optional
             Which cached spectrum images to use for intensity extraction.
@@ -701,27 +730,26 @@ class Dataset3dxeds(Dataset3dspectroscopy):
         if len(weighted_intensities) < 2:
             raise ValueError("At least two elements are required for Cliff-Lorimer quantification")
 
+        if type(self).atomic_weights is None:
+            type(self).load_atomic_weights()
+        atomic_weights = type(self).atomic_weights or {}
+        missing = [el for el in weighted_intensities if el not in atomic_weights]
+        if missing:
+            raise ValueError(f"Atomic weights not found for elements: {missing}")
+
         weighted_sum = sum(weighted_intensities.values())
-        atomic_percent = {
+        weight_percent = {
             el: 100.0 * val / weighted_sum if weighted_sum > 0 else 0.0
             for el, val in weighted_intensities.items()
         }
 
-        if type(self).atomic_weights is None:
-            type(self).load_atomic_weights()
-        atomic_weights = type(self).atomic_weights or {}
-        missing = [el for el in atomic_percent if el not in atomic_weights]
-        if missing:
-            raise ValueError(f"Atomic weights not found for elements: {missing}")
-
-        weight_sum = sum(
-            (atomic_percent[el] / 100.0) * float(atomic_weights[el]) for el in atomic_percent
-        )
-        weight_percent = {
-            el: (atomic_percent[el] / 100.0) * float(atomic_weights[el]) / weight_sum * 100.0
-            if weight_sum > 0
-            else 0.0
-            for el in atomic_percent
+        molar_quantities = {
+            el: weighted_intensities[el] / float(atomic_weights[el]) for el in weighted_intensities
+        }
+        molar_sum = sum(molar_quantities.values())
+        atomic_percent = {
+            el: 100.0 * molar_quantities[el] / molar_sum if molar_sum > 0 else 0.0
+            for el in weighted_intensities
         }
 
         ordered = sorted(weighted_intensities, key=weighted_intensities.get, reverse=True)
@@ -752,7 +780,7 @@ class Dataset3dxeds(Dataset3dspectroscopy):
         if return_maps:
             weighted_stack = np.stack(list(weighted_intensity_maps.values()), axis=0)
             weighted_sum_map = weighted_stack.sum(axis=0)
-            atomic_percent_maps = {
+            weight_percent_maps = {
                 el: np.divide(
                     wmap * 100.0,
                     weighted_sum_map,
@@ -761,19 +789,19 @@ class Dataset3dxeds(Dataset3dspectroscopy):
                 )
                 for el, wmap in weighted_intensity_maps.items()
             }
-            mass_maps = {
-                el: atomic_percent_maps[el] / 100.0 * float(atomic_weights[el])
-                for el in atomic_percent_maps
+            molar_maps = {
+                el: weighted_intensity_maps[el] / float(atomic_weights[el])
+                for el in weighted_intensity_maps
             }
-            mass_sum_map = np.sum(np.stack(list(mass_maps.values()), axis=0), axis=0)
-            weight_percent_maps = {
+            molar_sum_map = np.sum(np.stack(list(molar_maps.values()), axis=0), axis=0)
+            atomic_percent_maps = {
                 el: np.divide(
                     mmap * 100.0,
-                    mass_sum_map,
-                    out=np.zeros_like(mass_sum_map, dtype=float),
-                    where=mass_sum_map > 0,
+                    molar_sum_map,
+                    out=np.zeros_like(molar_sum_map, dtype=float),
+                    where=molar_sum_map > 0,
                 )
-                for el, mmap in mass_maps.items()
+                for el, mmap in molar_maps.items()
             }
             atomic_percent_maps = self._maps_to_dataset2d(
                 atomic_percent_maps,
